@@ -35,6 +35,7 @@ use hayabusa::options::profile::set_default_profile;
 use hayabusa::options::{expand_list::expand_list, level_tuning::LevelTuning, update::Update};
 use hayabusa::results::{self, OutputWriter, ResultOutputState};
 use hayabusa::timeline::computer_metrics::countup_event_by_computer;
+use hayabusa::timeline::sort_csv;
 use hayabusa::{detections::configs, timeline::timelines::Timeline};
 use hayabusa::{detections::utils::write_color_buffer, filter};
 use hayabusa::{options, yaml};
@@ -425,6 +426,12 @@ impl App {
     /// Dispatch and run the subcommand selected on the command line, then print the closing
     /// summary output (elapsed time, error log, HTML report, etc.).
     fn exec(&mut self, app: &mut Command, stored_static: &mut StoredStatic) {
+        // sort-csv is pure CSV post-processing: it needs none of the rule/profile/evtx machinery
+        // the other subcommands set up below, so handle it up front and return.
+        if let Some(Action::SortCsv(opt)) = stored_static.config.action.clone() {
+            sort_csv::sort_csv(&opt);
+            return;
+        }
         if stored_static.profiles.is_none() {
             return;
         }

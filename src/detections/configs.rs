@@ -252,6 +252,7 @@ impl StoredStatic {
             Some(Action::LogMetrics(opt)) => opt.common_options,
             Some(Action::ExpandList(opt)) => opt.common_options,
             Some(Action::ConfigCriticalSystems(opt)) => opt.common_options,
+            Some(Action::SortCsv(opt)) => opt.common_options,
             None => CommonOptions {
                 no_color: false,
                 quiet: false,
@@ -972,6 +973,16 @@ pub enum Action {
     )]
     /// Find critical systems like domain controllers and file servers.
     ConfigCriticalSystems(ConfigCriticalSystemsOption),
+
+    #[clap(
+        author = "Yamato Security (https://github.com/Yamato-Security/hayabusa - @SecurityYamato)",
+        help_template = help_banner("\n{author-with-newline}\n{usage-heading}\n  hayabusa.exe sort-csv <-f FILE | -d DIR> [OPTIONS]\n\n{all-args}"),
+        term_width = 400,
+        display_order = 452,
+        disable_help_flag = true
+    )]
+    /// Sort a Hayabusa CSV by timestamp and remove duplicate detections
+    SortCsv(SortCsvOption),
 }
 
 impl Action {
@@ -995,6 +1006,7 @@ impl Action {
                 Action::ExtractBase64(_) => 13,
                 Action::ExpandList(_) => 14,
                 Action::ConfigCriticalSystems(_) => 15,
+                Action::SortCsv(_) => 16,
             }
         } else {
             100
@@ -1020,6 +1032,7 @@ impl Action {
                 Action::ExtractBase64(_) => "extract-base64",
                 Action::ExpandList(_) => "expand-list",
                 Action::ConfigCriticalSystems(_) => "config-critical-systems",
+                Action::SortCsv(_) => "sort-csv",
             }
         } else {
             ""
@@ -1911,6 +1924,29 @@ pub struct ConfigCriticalSystemsOption {
     /// File path to one .evtx file
     #[arg(help_heading = Some("Input"), short = 'f', long = "file", value_name = "FILE", conflicts_with_all = ["directory"], display_order = 320)]
     pub filepath: Option<PathBuf>,
+
+    #[clap(flatten)]
+    pub common_options: CommonOptions,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+#[clap(group(ArgGroup::new("sort_csv_input").args(["directory", "filepath"]).required(true)))]
+pub struct SortCsvOption {
+    /// CSV file to sort
+    #[arg(help_heading = Some("Input"), short = 'f', long = "file", value_name = "FILE", conflicts_with_all = ["directory"], display_order = 320)]
+    pub filepath: Option<PathBuf>,
+
+    /// Directory of CSV files to sort together
+    #[arg(help_heading = Some("Input"), short = 'd', long, value_name = "DIR", conflicts_with_all = ["filepath"], display_order = 300)]
+    pub directory: Option<PathBuf>,
+
+    /// Save the sorted CSV to the given file (default: print to screen)
+    #[arg(help_heading = Some("Output"), short = 'o', long, value_name = "FILE", display_order = 410)]
+    pub output: Option<PathBuf>,
+
+    /// Overwrite the output file if it already exists
+    #[arg(help_heading = Some("Output"), short = 'C', long = "clobber", display_order = 411)]
+    pub clobber: bool,
 
     #[clap(flatten)]
     pub common_options: CommonOptions,

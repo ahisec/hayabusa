@@ -2,6 +2,10 @@
 
 ## x.x.x [xxxx/xx/xx]
 
+**New Features:**
+
+- Added a `sort-csv` command that post-processes a Hayabusa CSV: it keeps the header, sorts the rows by the `Timestamp` column, and removes duplicate detections (comparing every column except `EvtxFile`, so the same event collected from overlapping/backup `.evtx` files collapses to one entry). Takes a single file with `-f, --file` or a whole directory of CSVs with `-d, --directory` (handy for CSVs collected from many endpoints), and writes to `-o, --output` (or stdout), with `-C, --clobber` to overwrite. This does in post-processing what `--low-memory-mode` can't do during the scan. (#1295) (@ChrisJr404)
+
 **Enhancements:**
 
 - Added the `-G, --geo-ip` option to the `logon-summary` command, which appends `Source ASN`, `Source Country` and `Source City` columns for the source IP address of each summarized logon. (#1920) (@fukusuket)
