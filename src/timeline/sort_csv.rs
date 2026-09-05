@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone};
-use csv::{QuoteStyle, ReaderBuilder, WriterBuilder};
+use csv::{QuoteStyle, ReaderBuilder, StringRecord, WriterBuilder};
 use hashbrown::HashSet;
 
 use crate::detections::configs::SortCsvOption;
@@ -98,7 +98,11 @@ fn collect_input_files(opt: &SortCsvOption) -> Vec<PathBuf> {
 
 /// Read one CSV, returning its header row and its data rows. The header is checked against the
 /// first file's header by the caller so that rows from different files line up column-for-column.
-fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+///
+/// Rows are kept as the `csv::StringRecord` the reader already produced (2 allocations per row)
+/// instead of being converted to `Vec<String>` (one allocation per cell), which matters because
+/// every row of every input file is held in memory at once.
+fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<StringRecord>)> {
     let mut reader = match ReaderBuilder::new().flexible(true).from_path(path) {
         Ok(reader) => reader,
         Err(err) => {
@@ -120,7 +124,7 @@ fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let mut rows = vec![];
     for record in reader.records() {
         match record {
-            Ok(record) => rows.push(record.iter().map(str::to_string).collect::<Vec<_>>()),
+            Ok(record) => rows.push(record),
             Err(err) => {
                 AlertMessage::alert(&format!(
                     "Failed to read a row in {}. {err}",
@@ -134,19 +138,61 @@ fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     Some((header, rows))
 }
 
-/// The dedup key for a row: every cell except the `EvtxFile` column, so the same detection
-/// collected from overlapping/backup `.evtx` files collapses to one entry (same logic as
-/// `-X, --remove-duplicate-detections`).
-fn dedup_key(row: &[String], evtx_idx: Option<usize>) -> Vec<String> {
-    match evtx_idx {
-        Some(idx) => row
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx)
-            .map(|(_, cell)| cell.clone())
-            .collect(),
-        None => row.to_vec(),
+/// Order `rows` by `key_of` and keep only the first of any set of rows that are identical apart
+/// from the `EvtxFile` column, so the same detection collected from overlapping/backup `.evtx`
+/// files collapses to one entry (same logic as `-X, --remove-duplicate-detections`).
+///
+/// `key_of` drives both the sort and the dedup, and the caller deliberately cannot supply them
+/// separately. The dedup key contains the `Timestamp` column, so two rows that are duplicates of
+/// each other necessarily share a timestamp, hence a sort key: sorting by it makes them adjacent,
+/// so `seen` only has to hold one run of equal keys at a time instead of a copy of every unique
+/// row in the file. That reasoning holds only while the two uses agree. Keying the dedup on the
+/// raw timestamp string while sorting on the parsed value, for instance, would split a run
+/// whenever rows written in different timezones (`+09:00` and `+00:00` for the same instant)
+/// interleave, and duplicates would slip through. Same approach as `get_duplicate_indices` in
+/// `src/results/mod.rs`.
+fn sort_and_dedup<K, F>(
+    rows: &[StringRecord],
+    evtx_idx: Option<usize>,
+    mut key_of: F,
+) -> Vec<&StringRecord>
+where
+    K: Ord,
+    F: FnMut(usize) -> K,
+{
+    // Sorting indexes leaves the rows themselves in place. The sort is stable and the input order
+    // is already deterministic (`collect_input_files` sorts by path and rows follow file order),
+    // so ordering on the timestamp alone is reproducible without a tie-break on the row contents,
+    // which would deep-compare rows O(n log n) times. The rule that settles: rows sharing a
+    // timestamp are emitted in input order, i.e. path order, so the surviving row of a duplicate
+    // group is the one from the first input file rather than the one that sorts first by content.
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&i| key_of(i));
+
+    let mut output_rows = vec![];
+    let mut seen: HashSet<Vec<&str>> = HashSet::new();
+    let mut prev_key: Option<K> = None;
+    for idx in order {
+        let key = key_of(idx);
+        if prev_key.as_ref() != Some(&key) {
+            seen.clear();
+            prev_key = Some(key);
+        }
+        let row = &rows[idx];
+        let dedup_key: Vec<&str> = match evtx_idx {
+            Some(i) => row
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, cell)| cell)
+                .collect(),
+            None => row.iter().collect(),
+        };
+        if seen.insert(dedup_key) {
+            output_rows.push(row);
+        }
     }
+    output_rows
 }
 
 pub fn sort_csv(opt: &SortCsvOption) {
@@ -157,7 +203,7 @@ pub fn sort_csv(opt: &SortCsvOption) {
     }
 
     let mut header: Option<Vec<String>> = None;
-    let mut rows: Vec<Vec<String>> = vec![];
+    let mut rows: Vec<StringRecord> = vec![];
     for file in &files {
         let Some((file_header, file_rows)) = read_csv(file) else {
             process::exit(1);
@@ -187,32 +233,34 @@ pub fn sort_csv(opt: &SortCsvOption) {
     };
     let evtx_idx = header.iter().position(|col| col == EVTX_FILE_COLUMN);
 
-    // Sort by timestamp, then by the full row so the ordering is a stable total order (identical
-    // timestamps come out the same on every run). If any row's timestamp is in a format we don't
-    // recognize, fall back to a lexical sort on the raw timestamp string.
-    let parsed: Vec<Option<i128>> = rows
+    // Sentinel for a timestamp none of the known formats matched. `parsed` is only read when
+    // `all_parsed` is true, so this value can never take part in the ordering. Storing a plain
+    // `i128` rather than `Option<i128>` halves the table: `Option<i128>` has no niche, so it
+    // costs 32 bytes per row to carry 16 bytes of data. `all_parsed` is settled by the time the
+    // vector exists, because `collect` drives the whole iterator.
+    const UNPARSED: i128 = i128::MIN;
+
+    let mut all_parsed = true;
+    let parsed: Vec<i128> = rows
         .iter()
-        .map(|row| row.get(timestamp_idx).and_then(|ts| parse_timestamp(ts)))
+        .map(
+            |row| match row.get(timestamp_idx).and_then(parse_timestamp) {
+                Some(key) => key,
+                None => {
+                    all_parsed = false;
+                    UNPARSED
+                }
+            },
+        )
         .collect();
-    let all_parsed = parsed.iter().all(Option::is_some);
 
-    let mut order: Vec<usize> = (0..rows.len()).collect();
-    order.sort_by(|&a, &b| {
-        let primary = if all_parsed {
-            parsed[a].cmp(&parsed[b])
-        } else {
-            rows[a].get(timestamp_idx).cmp(&rows[b].get(timestamp_idx))
-        };
-        primary.then_with(|| rows[a].cmp(&rows[b]))
-    });
-
-    let mut seen: HashSet<Vec<String>> = HashSet::new();
-    let mut output_rows: Vec<&Vec<String>> = vec![];
-    for &idx in &order {
-        if seen.insert(dedup_key(&rows[idx], evtx_idx)) {
-            output_rows.push(&rows[idx]);
-        }
-    }
+    // Sort and dedup on the parsed timestamp. If any row's timestamp is in a format we don't
+    // recognize, fall back to the raw timestamp string, which orders lexically.
+    let output_rows = if all_parsed {
+        sort_and_dedup(&rows, evtx_idx, |i| parsed[i])
+    } else {
+        sort_and_dedup(&rows, evtx_idx, |i| rows[i].get(timestamp_idx))
+    };
 
     if let Err(err) = write_output(opt, &header, &output_rows) {
         AlertMessage::alert(&format!("Failed to write output. {err}")).ok();
@@ -220,7 +268,7 @@ pub fn sort_csv(opt: &SortCsvOption) {
     }
 }
 
-fn write_output(opt: &SortCsvOption, header: &[String], rows: &[&Vec<String>]) -> io::Result<()> {
+fn write_output(opt: &SortCsvOption, header: &[String], rows: &[&StringRecord]) -> io::Result<()> {
     let sink: Box<dyn Write> = if let Some(path) = &opt.output {
         if path.exists() && !opt.clobber {
             AlertMessage::alert(&format!(
@@ -240,7 +288,7 @@ fn write_output(opt: &SortCsvOption, header: &[String], rows: &[&Vec<String>]) -
         .from_writer(sink);
     writer.write_record(header)?;
     for row in rows {
-        writer.write_record(row.iter())?;
+        writer.write_record(*row)?;
     }
     writer.flush()?;
     Ok(())
@@ -250,9 +298,14 @@ fn write_output(opt: &SortCsvOption, header: &[String], rows: &[&Vec<String>]) -
 mod tests {
     use super::*;
 
+    /// A path in the system temp dir, namespaced by process id so two test runs on the same
+    /// machine do not fight over the same file.
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hayabusa_sortcsv_test_{}_{name}", process::id()))
+    }
+
     fn write_temp(name: &str, contents: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("hayabusa_sortcsv_test_{name}"));
+        let path = temp_path(name);
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         path
@@ -267,7 +320,7 @@ mod tests {
 \"2021-12-13 09:00:00.000 +09:00\",\"Earlier\",\"host1\",\"a.evtx\"\n\
 \"2021-12-13 09:00:00.000 +09:00\",\"Earlier\",\"host1\",\"backup.evtx\"\n";
         let in_path = write_temp("in.csv", input);
-        let out_path = std::env::temp_dir().join("hayabusa_sortcsv_test_out.csv");
+        let out_path = temp_path("out.csv");
         let _ = fs::remove_file(&out_path);
 
         let opt = SortCsvOption {
@@ -295,6 +348,91 @@ mod tests {
 
         let _ = fs::remove_file(&in_path);
         let _ = fs::remove_file(&out_path);
+    }
+
+    /// Run `sort_csv` over `input` and return the lines it wrote. `name` has to be unique per
+    /// test because the temp files are named after it and tests run in parallel.
+    fn run_sort_csv(name: &str, input: &str) -> Vec<String> {
+        let in_path = write_temp(&format!("{name}_in.csv"), input);
+        let out_path = temp_path(&format!("{name}_out.csv"));
+        let _ = fs::remove_file(&out_path);
+
+        let opt = SortCsvOption {
+            filepath: Some(in_path.clone()),
+            directory: None,
+            output: Some(out_path.clone()),
+            clobber: true,
+            common_options: Default::default(),
+        };
+        sort_csv(&opt);
+
+        let result = fs::read_to_string(&out_path).unwrap();
+        let _ = fs::remove_file(&in_path);
+        let _ = fs::remove_file(&out_path);
+        result.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn duplicates_sharing_a_timestamp_are_removed_even_when_not_adjacent() {
+        // `seen` is cleared at every timestamp-group boundary, so a duplicate is only caught if
+        // both copies land in the same group. Here another row with the same timestamp sits
+        // between them in the input, which is exactly the case a per-row reset would miss.
+        let input = "\"Timestamp\",\"RuleTitle\",\"Computer\",\"EvtxFile\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Dup\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Other\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Dup\",\"host1\",\"backup.evtx\"\n";
+        let lines = run_sort_csv("nonadjacent", input);
+
+        // Header + Dup + Other: the second copy of Dup is gone.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.iter().filter(|line| line.contains("Dup")).count(), 1);
+    }
+
+    #[test]
+    fn duplicates_are_removed_when_offsets_differ_within_one_timestamp_group() {
+        // These CSVs were written in different timezones, so rows for the same instant carry
+        // different timestamp strings and interleave inside a single sort-key group. Resetting
+        // `seen` on the raw string instead of the sort key would split the two Dup rows apart
+        // and let the duplicate through.
+        let input = "\"Timestamp\",\"RuleTitle\",\"Computer\",\"EvtxFile\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Dup\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 00:00:00.000 +00:00\",\"Other\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Dup\",\"host1\",\"backup.evtx\"\n";
+        let lines = run_sort_csv("mixedoffsets", input);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.iter().filter(|line| line.contains("Dup")).count(), 1);
+    }
+
+    #[test]
+    fn rows_sharing_a_timestamp_keep_their_input_order() {
+        // The sort has no tie-break on the row contents, so rows with the same timestamp come
+        // out in input order (path order across files). This is the documented rule, not an
+        // accident of the comparator: with a content tie-break "Alpha" would sort first.
+        let input = "\"Timestamp\",\"RuleTitle\",\"Computer\",\"EvtxFile\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Zulu\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Alpha\",\"host1\",\"a.evtx\"\n";
+        let lines = run_sort_csv("inputorder", input);
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("Zulu"));
+        assert!(lines[2].contains("Alpha"));
+    }
+
+    #[test]
+    fn lexical_fallback_still_sorts_and_dedups() {
+        // One unrecognized timestamp flips the whole file to the lexical fallback; sorting and
+        // dedup have to keep working on the raw strings.
+        let input = "\"Timestamp\",\"RuleTitle\",\"Computer\",\"EvtxFile\"\n\
+\"zzz not a timestamp\",\"Unparsable\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Dup\",\"host1\",\"a.evtx\"\n\
+\"2021-12-13 09:00:00.000 +09:00\",\"Dup\",\"host1\",\"backup.evtx\"\n";
+        let lines = run_sort_csv("fallback", input);
+
+        // Header + Dup + Unparsable: the duplicate is gone and "2..." sorts before "z...".
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("Dup"));
+        assert!(lines[2].contains("Unparsable"));
     }
 
     #[test]
